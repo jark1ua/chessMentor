@@ -4,3 +4,6 @@ mss>=9.0.1
 Pillow>=10.0.0
 stockfish>=3.28.0
 rich>=13.0.0
+openai>=1.0.0
+google-generativeai>=0.5.0
+requests>=2.31.0

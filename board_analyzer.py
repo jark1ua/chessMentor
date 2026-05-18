@@ -1,96 +1,50 @@
 """
-Board position extraction from a screenshot via Claude vision.
+Board position extraction from a screenshot.
 
-Sends the image to Claude and asks it to return the FEN of the visible
-position.  Falls back gracefully when the image doesn't show a chess board.
+Thin wrapper that delegates to the configured VisionProvider.
+For standalone/legacy use, defaults to ClaudeVision.
 """
-import re
 from typing import Optional, Tuple
 import chess
-import anthropic
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 
-_client: Optional[anthropic.Anthropic] = None
+from providers.vision import get_vision_provider, VisionProvider
 
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
+# Module-level provider — set by main.py at startup, or lazily built from env.
+_provider: Optional[VisionProvider] = None
 
 
-_VISION_PROMPT = """\
-You are a chess position recognizer. The user has provided a screenshot that
-may contain a chess board.
+def set_provider(provider: VisionProvider) -> None:
+    """Set the vision provider (called from main.py at startup)."""
+    global _provider
+    _provider = provider
 
-Your task:
-1. Identify whether a chess board is visible in the image.
-2. If yes, determine the position of all pieces and return the FEN string for
-   that position (piece placement only — you may omit castling/en-passant/clocks
-   if you cannot reliably determine them, but include the active color if you
-   can tell whose turn it is).
-3. Also identify the player color at the bottom of the board (white or black).
-4. If no board is visible or the position is unclear, respond with: NO_BOARD
 
-Respond ONLY in this JSON format (no markdown, no explanation):
-{"fen": "<FEN or NO_BOARD>", "bottom_color": "<white|black|unknown>"}
-"""
+def _get_provider() -> VisionProvider:
+    global _provider
+    if _provider is None:
+        # Lazy fallback: build from environment config
+        from config import (
+            ANTHROPIC_API_KEY, CLAUDE_MODEL,
+            OPENAI_API_KEY, OPENAI_VISION_MODEL,
+            GEMINI_API_KEY, GEMINI_VISION_MODEL,
+            VISION_PROVIDER,
+        )
+        cfg = {
+            "vision_provider": VISION_PROVIDER,
+            "anthropic_api_key": ANTHROPIC_API_KEY,
+            "claude_model": CLAUDE_MODEL,
+            "openai_api_key": OPENAI_API_KEY,
+            "openai_vision_model": OPENAI_VISION_MODEL,
+            "gemini_api_key": GEMINI_API_KEY,
+            "gemini_vision_model": GEMINI_VISION_MODEL,
+        }
+        _provider = get_vision_provider(cfg)
+    return _provider
 
 
 def extract_position(image_b64: str) -> Tuple[Optional[chess.Board], str]:
     """
     Returns (board, bottom_color) or (None, 'unknown') if no board found.
-    bottom_color is 'white' or 'black'.
+    bottom_color is 'white', 'black', or 'unknown'.
     """
-    client = _get_client()
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=256,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": _VISION_PROMPT},
-                ],
-            }
-        ],
-    )
-
-    raw = response.content[0].text.strip()
-
-    # extract JSON even if model wraps it
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
-        return None, "unknown"
-
-    import json
-    try:
-        data = json.loads(match.group())
-    except json.JSONDecodeError:
-        return None, "unknown"
-
-    fen = data.get("fen", "NO_BOARD")
-    bottom_color = data.get("bottom_color", "unknown")
-
-    if fen == "NO_BOARD" or not fen:
-        return None, bottom_color
-
-    # validate / parse FEN
-    try:
-        # If only piece placement was returned, add defaults
-        parts = fen.split()
-        if len(parts) == 1:
-            fen = fen + " w - - 0 1"
-        board = chess.Board(fen)
-        return board, bottom_color
-    except ValueError:
-        return None, bottom_color
+    return _get_provider().extract_position(image_b64)

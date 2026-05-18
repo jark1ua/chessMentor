@@ -1,14 +1,17 @@
 """
 LLM-powered chess coach.
 
-Maintains a rolling conversation per session and calls Claude to give
-contextual guidance, update the user profile, and persist lessons.
+Maintains a rolling conversation per session and calls the configured
+LLMProvider to give contextual guidance, update the user profile, and
+persist lessons.  Injects relevant chess principles from the knowledge
+base into each coaching call.
 """
 from typing import Optional, List, Dict, Any
 import json
 import chess
-import anthropic
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL
+
+from providers.llm import LLMProvider, get_llm_provider
+from knowledge.retrieval import get_relevant_principles, format_principles_for_prompt
 from profile import (
     profile_summary_text,
     append_lesson,
@@ -30,9 +33,9 @@ player across multiple sessions.  Your role is to:
 4. After your coaching message, emit a JSON block on its own line (no markdown
    fences) in this exact format so the system can update the player profile:
 
-PROFILE_UPDATE:{"lessons":["..."],"weaknesses":["..."],"strengths":["..."],
-"opening":{"color":"<white|black>","name":"<opening name or empty>"},
-"coach_note":"<one-sentence persistent note or empty>"}
+PROFILE_UPDATE:{{"lessons":["..."],"weaknesses":["..."],"strengths":["..."],
+"opening":{{"color":"<white|black>","name":"<opening name or empty>"}},
+"coach_note":"<one-sentence persistent note or empty>"}}
 
    All fields are optional — omit or leave empty if nothing new to record.
    Only include lessons/weaknesses/strengths that are genuinely new insights.
@@ -41,26 +44,49 @@ Keep your coaching reply under 120 words.  Be encouraging but honest.
 
 --- Player Profile ---
 {profile}
+
+{principles}
 """
 
-_client: Optional[anthropic.Anthropic] = None
 
-
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
+def _build_system(profile: dict, board: chess.Board, debug: bool = False) -> str:
+    principles = get_relevant_principles(board, profile, n=3)
+    if debug:
+        print(f"[DEBUG] Injecting principles: {[p['id'] for p in principles]}")
+    principles_block = format_principles_for_prompt(principles)
+    return _SYSTEM_PROMPT.format(
+        profile=profile_summary_text(profile),
+        principles=principles_block,
+    )
 
 
 class CoachSession:
-    def __init__(self, profile: dict):
+    def __init__(self, profile: dict, llm_provider: Optional[LLMProvider] = None,
+                 debug: bool = False):
         self.profile = profile
         self.messages: List[Dict[str, Any]] = []
-        self.system = _SYSTEM_PROMPT.replace("{profile}", profile_summary_text(profile))
+        self._llm = llm_provider
+        self._debug = debug
 
-    def _system_with_updated_profile(self) -> str:
-        return _SYSTEM_PROMPT.replace("{profile}", profile_summary_text(self.profile))
+    def _get_llm(self) -> LLMProvider:
+        if self._llm is None:
+            from config import (
+                ANTHROPIC_API_KEY, CLAUDE_MODEL,
+                OPENAI_API_KEY, OPENAI_LLM_MODEL,
+                OLLAMA_BASE_URL, OLLAMA_MODEL,
+                LLM_PROVIDER,
+            )
+            cfg = {
+                "llm_provider": LLM_PROVIDER,
+                "anthropic_api_key": ANTHROPIC_API_KEY,
+                "claude_model": CLAUDE_MODEL,
+                "openai_api_key": OPENAI_API_KEY,
+                "openai_llm_model": OPENAI_LLM_MODEL,
+                "ollama_base_url": OLLAMA_BASE_URL,
+                "ollama_model": OLLAMA_MODEL,
+            }
+            self._llm = get_llm_provider(cfg)
+        return self._llm
 
     def coach(
         self,
@@ -71,26 +97,18 @@ class CoachSession:
         player_color: str,
     ) -> str:
         """
-        Send current position context to Claude and return coaching text.
+        Send current position context to the LLM and return coaching text.
         Also parses PROFILE_UPDATE and mutates self.profile accordingly.
         """
         context = _build_context(board, engine_result, last_move_san, delta_cp, player_color)
         self.messages.append({"role": "user", "content": context})
 
-        response = _get_client().messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=512,
-            system=self._system_with_updated_profile(),
-            messages=self.messages,
-        )
-
-        reply = response.content[0].text.strip()
+        system = _build_system(self.profile, board, debug=self._debug)
+        reply = self._get_llm().chat(system, self.messages)
         self.messages.append({"role": "assistant", "content": reply})
 
-        # parse and apply profile updates
         coaching_text = _apply_profile_update(reply, self.profile)
         save_profile(self.profile)
-
         return coaching_text
 
     def end_game_summary(self, result: str) -> str:
@@ -102,14 +120,21 @@ class CoachSession:
         )
         self.messages.append({"role": "user", "content": prompt})
 
-        response = _get_client().messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=600,
-            system=self._system_with_updated_profile(),
-            messages=self.messages,
-        )
+        # Use a simple board for end-of-game principles injection
+        try:
+            board = chess.Board()
+        except Exception:
+            board = None
 
-        reply = response.content[0].text.strip()
+        if board is not None:
+            system = _build_system(self.profile, board, debug=self._debug)
+        else:
+            system = _SYSTEM_PROMPT.format(
+                profile=profile_summary_text(self.profile),
+                principles="",
+            )
+
+        reply = self._get_llm().chat(system, self.messages)
         self.messages.append({"role": "assistant", "content": reply})
 
         coaching_text = _apply_profile_update(reply, self.profile)
@@ -144,10 +169,11 @@ def _build_context(
 
     cp = engine_result.get("score_cp")
     mate = engine_result.get("mate_in")
+    source = engine_result.get("source", "local")
     if mate is not None:
-        lines.append(f"Engine evaluation: Mate in {abs(mate)}")
+        lines.append(f"Engine evaluation: Mate in {abs(mate)} (source: {source})")
     elif cp is not None:
-        lines.append(f"Engine evaluation: {cp/100:+.2f} pawns (white perspective)")
+        lines.append(f"Engine evaluation: {cp/100:+.2f} pawns (white perspective, source: {source})")
 
     top = engine_result.get("top_moves", [])
     if top:

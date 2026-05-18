@@ -1,5 +1,5 @@
 """
-ChessMentor — real-time chess coaching via screen capture + Stockfish + Claude.
+ChessMentor — real-time chess coaching via screen capture + engine + LLM.
 
 Usage:
     python main.py                    # start a coaching session
@@ -16,30 +16,85 @@ from typing import Optional
 
 import chess
 
-from config import CAPTURE_INTERVAL, COACHING_THRESHOLD, ANTHROPIC_API_KEY
+from config import (
+    CAPTURE_INTERVAL, COACHING_THRESHOLD, ANTHROPIC_API_KEY,
+    ENGINE_PROVIDER, VISION_PROVIDER, LLM_PROVIDER,
+    STOCKFISH_PATH, ENGINE_TOP_MOVES,
+    OPENAI_API_KEY, OPENAI_VISION_MODEL, OPENAI_LLM_MODEL,
+    GEMINI_API_KEY, GEMINI_VISION_MODEL,
+    OLLAMA_BASE_URL, OLLAMA_MODEL,
+    CLAUDE_MODEL,
+)
 from capture import select_region_interactively, capture, image_to_base64, save_debug_image
-from board_analyzer import extract_position
-from engine import analyse, eval_delta, score_label, close_engine
+import board_analyzer
+import engine as engine_module
 from coach import CoachSession
 from profile import (
     load_profile, save_profile, append_match_summary,
     load_history, profile_summary_text
 )
+from providers.engine import get_engine
+from providers.vision import get_vision_provider
+from providers.llm import get_llm_provider
+from providers.depth import depth_rationale
 
 try:
     from rich.console import Console
     from rich.panel import Panel
-    from rich.text import Text
     console = Console()
     def info(msg): console.print(f"[cyan]{msg}[/cyan]")
     def warn(msg): console.print(f"[yellow]{msg}[/yellow]")
     def coach_msg(msg): console.print(Panel(msg, title="[bold green]ChessMentor[/bold green]", expand=False))
     def err(msg): console.print(f"[bold red]{msg}[/bold red]")
+    def debug(msg): console.print(f"[dim]{msg}[/dim]")
 except ImportError:
     def info(msg): print(f"[INFO] {msg}")
     def warn(msg): print(f"[WARN] {msg}")
     def coach_msg(msg): print(f"\n=== ChessMentor ===\n{msg}\n==================\n")
     def err(msg): print(f"[ERROR] {msg}")
+    def debug(msg): print(f"[DEBUG] {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Provider initialisation
+# ---------------------------------------------------------------------------
+
+def build_config(profile: dict) -> dict:
+    return {
+        "engine_provider": ENGINE_PROVIDER,
+        "stockfish_path": STOCKFISH_PATH,
+        "engine_top_moves": ENGINE_TOP_MOVES,
+        "vision_provider": VISION_PROVIDER,
+        "llm_provider": LLM_PROVIDER,
+        "anthropic_api_key": ANTHROPIC_API_KEY,
+        "claude_model": CLAUDE_MODEL,
+        "openai_api_key": OPENAI_API_KEY,
+        "openai_vision_model": OPENAI_VISION_MODEL,
+        "openai_llm_model": OPENAI_LLM_MODEL,
+        "gemini_api_key": GEMINI_API_KEY,
+        "gemini_vision_model": GEMINI_VISION_MODEL,
+        "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_model": OLLAMA_MODEL,
+    }
+
+
+def initialise_providers(profile: dict):
+    """Create and register all provider instances; print which are active."""
+    cfg = build_config(profile)
+
+    engine_provider = get_engine(profile, cfg)
+    vision_provider = get_vision_provider(cfg)
+    llm_provider    = get_llm_provider(cfg)
+
+    board_analyzer.set_provider(vision_provider)
+    engine_module.set_provider(engine_provider, profile)
+
+    engine_label = ENGINE_PROVIDER
+    vision_label = VISION_PROVIDER
+    llm_label    = LLM_PROVIDER
+
+    info(f"Active providers — engine: {engine_label} | vision: {vision_label} | llm: {llm_label}")
+    return llm_provider
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +135,10 @@ def cmd_set_rating(rating: int):
 # ---------------------------------------------------------------------------
 
 class Session:
-    def __init__(self, region, profile):
+    def __init__(self, region, profile, llm_provider):
         self.region = region
         self.profile = profile
-        self.coach_session = CoachSession(profile)
+        self.coach_session = CoachSession(profile, llm_provider=llm_provider, debug=True)
         self.prev_fen: Optional[str] = None
         self.prev_cp: Optional[int] = None
         self.prev_board: Optional[chess.Board] = None
@@ -108,14 +163,13 @@ class Session:
                 warn(f"Tick error: {exc}")
             time.sleep(CAPTURE_INTERVAL)
 
-        # end-of-session cleanup
         self._wrap_up()
 
     def _tick(self):
         img = capture(self.region)
         img_b64 = image_to_base64(img)
 
-        board, bottom_color = extract_position(img_b64)
+        board, bottom_color = board_analyzer.extract_position(img_b64)
         if board is None:
             info("No board detected in screenshot.")
             return
@@ -127,19 +181,24 @@ class Session:
         if fen == self.prev_fen:
             return  # position unchanged
 
-        info(f"Position changed  eval: {self._eval_str(board)}")
-
-        engine_result = analyse(board)
+        engine_result = engine_module.analyse(board)
         curr_cp = engine_result.get("score_cp")
 
-        # figure out last move by diffing boards
+        # Print adaptive depth rationale for this position
+        try:
+            rationale = depth_rationale(self.profile, board)
+            debug(f"Engine depth: {rationale}")
+        except Exception:
+            pass
+
+        info(f"Position changed  eval: {engine_module.score_label(curr_cp, engine_result.get('mate_in'))}")
+
         last_move_san = self._detect_last_move(self.prev_board, board)
 
         delta = None
         if self.prev_cp is not None and self.prev_board is not None:
-            # determine whose move it was (prev board's turn)
             player_just_moved_white = (self.prev_board.turn == chess.WHITE)
-            delta = eval_delta(self.prev_cp, curr_cp, player_just_moved_white)
+            delta = engine_module.eval_delta(self.prev_cp, curr_cp, player_just_moved_white)
 
         self.prev_fen = fen
         self.prev_cp = curr_cp
@@ -147,9 +206,9 @@ class Session:
         self.move_count += 1
 
         should_coach = (
-            delta is None  # first move
+            delta is None
             or abs(delta) >= COACHING_THRESHOLD
-            or self.move_count % 5 == 0  # periodic check-in every 5 moves
+            or self.move_count % 5 == 0
         )
 
         if should_coach:
@@ -161,16 +220,8 @@ class Session:
             except Exception as exc:
                 warn(f"Coach error: {exc}")
 
-    def _eval_str(self, board: chess.Board) -> str:
-        try:
-            r = analyse(board)
-            return score_label(r.get("score_cp"), r.get("mate_in"))
-        except Exception:
-            return "?"
-
     @staticmethod
     def _detect_last_move(prev: Optional[chess.Board], curr: chess.Board) -> Optional[str]:
-        """Try to identify the last move by comparing positions."""
         if prev is None:
             return None
         try:
@@ -193,7 +244,7 @@ class Session:
                                    "moves_analyzed": self.move_count})
         except Exception as exc:
             warn(f"Summary error: {exc}")
-        close_engine()
+        engine_module.close_engine()
         info("Profile saved.  Goodbye!")
 
 
@@ -220,7 +271,7 @@ def main():
     if args.set_rating:
         cmd_set_rating(args.set_rating); return
 
-    if not ANTHROPIC_API_KEY:
+    if not ANTHROPIC_API_KEY and LLM_PROVIDER == "claude":
         err("ANTHROPIC_API_KEY is not set.  Export it before running ChessMentor.")
         sys.exit(1)
 
@@ -228,6 +279,8 @@ def main():
     if not profile["username"]:
         profile["username"] = input("Your name (for the profile): ").strip() or "Player"
         save_profile(profile)
+
+    llm_provider = initialise_providers(profile)
 
     # region
     if args.region:
@@ -239,10 +292,10 @@ def main():
     if args.debug_capture:
         img = capture(region)
         save_debug_image(img)
-        info(f"Saved capture to /tmp/chess_capture.png")
+        info("Saved capture to /tmp/chess_capture.png")
         return
 
-    session = Session(region, profile)
+    session = Session(region, profile, llm_provider)
     session.run()
 
 

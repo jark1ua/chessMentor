@@ -27,6 +27,24 @@ COACHING_THRESHOLD = int(os.environ.get("COACHING_THRESHOLD", "100"))
 # Anthropic model
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 
+# Provider selection
+ENGINE_PROVIDER = os.environ.get("ENGINE_PROVIDER", "auto")   # auto|lichess|local
+VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "claude") # claude|openai|gemini
+LLM_PROVIDER    = os.environ.get("LLM_PROVIDER", "claude")    # claude|openai|ollama
+
+# Additional API keys
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+
+# Ollama settings
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "llama3")
+
+# Provider-specific model overrides
+OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
+OPENAI_LLM_MODEL    = os.environ.get("OPENAI_LLM_MODEL", "gpt-4o")
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-1.5-flash")
+
 
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
