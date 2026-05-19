@@ -59,5 +59,12 @@ OPENAI_LLM_MODEL    = os.environ.get("OPENAI_LLM_MODEL", "gpt-4o")
 GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-1.5-flash")
 
 
+# Dashboard
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "5555"))
+
+# Directory where annotated PGN files are saved (default: ~/.chessMentor/pgns/)
+PGN_SAVE_DIR = Path(os.environ.get("PGN_SAVE_DIR", str(DATA_DIR / "pgns")))
+
+
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)

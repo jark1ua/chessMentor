@@ -3,23 +3,31 @@ LLM-powered chess coach.
 
 Architecture
 ------------
-* Tool use — profile updates are structured function calls, not fragile text
-  parsing.  Both Claude (tool_use) and OpenAI (function_calling) support this
-  natively.  Ollama falls back to JSON text extraction.
+* Tool use — profile updates are structured function calls (Claude/OpenAI) or
+  extracted from JSON text (Ollama).
 
-* Persistent conversation — the message history is serialised to
-  ~/.chessMentor/conversation.json and reloaded on the next session so the
-  coach retains full memory of everything discussed.  The history is trimmed
-  to CONVERSATION_MAX_MESSAGES to bound token cost.
+* String markers — LLM responses may also carry profile updates inside
+  [CHESSMGR:PROFILE]{...}[/CHESSMGR:PROFILE] markers.  These are stripped
+  before display and applied just like tool-call results.  Useful as a
+  fallback for providers that don't support tool use, and as a plain-text
+  backup of all profile changes.
 
-* Prompt caching — the large system prompt (profile + 100+ principles block)
-  is marked with cache_control so Anthropic's API serves it from cache on
-  repeated calls within a session, cutting input token cost significantly.
+* Conversation persistence — the full message history is serialised to
+  ~/.chessMentor/conversation.json on every turn (unlimited history as a
+  backup record).  Only the most recent CONTEXT_WINDOW messages are sent
+  to the LLM API to stay within token limits.
+
+* Prompt caching — the large system prompt is marked with cache_control so
+  Anthropic's API serves it from cache on repeated calls within a session.
+
+* Pre-match chat — the chat() method provides freeform conversation outside
+  the match loop (opening advice, questions, debriefs).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional, List, Dict, Any
 
 import chess
@@ -42,13 +50,40 @@ from profile import (
 # Conversation settings
 # ---------------------------------------------------------------------------
 
-CONVERSATION_MAX_MESSAGES = 60   # keep last 60 messages (~30 exchanges)
+# Messages sent to the LLM per turn (keeps API calls within token limits).
+# The full history is always saved to disk as a backup record.
+CONTEXT_WINDOW = 40
+
+# ---------------------------------------------------------------------------
+# String-marker profile update (backup mechanism)
+# ---------------------------------------------------------------------------
+
+_PROFILE_MARKER_RE = re.compile(
+    r'\[CHESSMGR:PROFILE\](.*?)\[/CHESSMGR:PROFILE\]',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_profile_markers(text: str) -> Optional[dict]:
+    """Return parsed JSON from a [CHESSMGR:PROFILE]...[/CHESSMGR:PROFILE] block, or None."""
+    match = _PROFILE_MARKER_RE.search(text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1).strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def _strip_profile_markers(text: str) -> str:
+    """Remove marker blocks from text before displaying to the player."""
+    return _PROFILE_MARKER_RE.sub("", text).strip()
+
 
 # ---------------------------------------------------------------------------
 # Tool definition: update_player_profile
 # ---------------------------------------------------------------------------
 
-# Anthropic / OpenAI compatible tool schema
 PROFILE_TOOL = {
     "name": "update_player_profile",
     "description": (
@@ -79,14 +114,8 @@ PROFILE_TOOL = {
                 "type": "object",
                 "description": "Opening played in this game (if identifiable).",
                 "properties": {
-                    "color": {
-                        "type": "string",
-                        "enum": ["white", "black"],
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Opening name, e.g. 'Sicilian Najdorf'.",
-                    },
+                    "color": {"type": "string", "enum": ["white", "black"]},
+                    "name":  {"type": "string", "description": "Opening name, e.g. 'Sicilian Najdorf'."},
                 },
                 "required": ["color", "name"],
             },
@@ -100,7 +129,7 @@ PROFILE_TOOL = {
 }
 
 # ---------------------------------------------------------------------------
-# System prompt template
+# System prompt templates
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
@@ -117,6 +146,10 @@ Your role each turn:
    to persist any new insights — even if there is nothing new, call it with \
    empty arrays so the system knows the turn completed.
 
+Optionally you may also embed a [CHESSMGR:PROFILE]{...}[/CHESSMGR:PROFILE] \
+JSON block as a fallback for providers that do not support tool use. \
+The block will be stripped before the reply is shown to the player.
+
 Keep your coaching reply under 120 words.  Be encouraging but honest.
 
 --- Player Profile ---
@@ -125,8 +158,24 @@ Keep your coaching reply under 120 words.  Be encouraging but honest.
 {principles}
 """
 
+_CHAT_SYSTEM = """\
+You are ChessMentor, an expert chess coach.  You are in a pre-match or \
+inter-match discussion with the player.  Draw on their profile to give \
+personalised advice about openings, strategy, or anything they ask about.
+
+If you identify new insights worth remembering, embed them in a \
+[CHESSMGR:PROFILE]{...}[/CHESSMGR:PROFILE] block (valid JSON matching the \
+update_player_profile schema).  This block will be stripped before display.
+
+Keep replies concise and practical (under 200 words unless a longer \
+explanation is genuinely needed).
+
+--- Player Profile ---
+{profile}
+"""
+
 # ---------------------------------------------------------------------------
-# Helper: apply a tool call result to the profile
+# Helper: apply tool-call / marker result to the profile dict
 # ---------------------------------------------------------------------------
 
 def _apply_tool_input(data: dict, profile: dict) -> None:
@@ -148,15 +197,10 @@ def _apply_tool_input(data: dict, profile: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helper: fallback JSON extraction for providers without tool use (Ollama)
+# Helper: fallback JSON extraction for Ollama / unconfigured providers
 # ---------------------------------------------------------------------------
 
 def _extract_json_fallback(text: str) -> Optional[dict]:
-    """
-    Try to parse a JSON object from anywhere in *text*.
-    Used when the LLM provider doesn't support tool use.
-    """
-    import re
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if not match:
         return None
@@ -174,9 +218,8 @@ class CoachSession:
     """
     Manages a multi-turn coaching conversation that persists across sessions.
 
-    Message history is loaded from disk on init and saved on every turn.
-    Profile updates arrive via structured tool calls (Claude/OpenAI) or JSON
-    fallback (Ollama/other).
+    Full message history is saved to disk on every turn; only the most recent
+    CONTEXT_WINDOW messages are sent to the LLM to stay within token limits.
     """
 
     def __init__(
@@ -188,10 +231,8 @@ class CoachSession:
         self.profile = profile
         self._llm = llm_provider
         self._debug = debug
-        # Load persisted conversation; trim to max length
+        # Load full persisted history (no cap — kept entirely on disk)
         self.messages: List[Dict[str, Any]] = load_conversation()
-        if len(self.messages) > CONVERSATION_MAX_MESSAGES:
-            self.messages = self.messages[-CONVERSATION_MAX_MESSAGES:]
 
     def _get_llm(self) -> LLMProvider:
         if self._llm is None:
@@ -222,9 +263,38 @@ class CoachSession:
         )
 
     def _persist(self) -> None:
-        """Save conversation + profile to disk."""
-        save_conversation(self.messages[-CONVERSATION_MAX_MESSAGES:])
+        """Save the full conversation history and current profile to disk."""
+        save_conversation(self.messages)
         save_profile(self.profile)
+
+    def _api_messages(self) -> List[Dict]:
+        """Return the slice of history to send to the LLM API."""
+        return self.messages[-CONTEXT_WINDOW:]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def chat(self, user_input: str) -> str:
+        """
+        Freeform conversation turn — used for pre-match chat, opening
+        discussions, and debriefs.  No board context, no mandatory tool use.
+        """
+        self.messages.append({"role": "user", "content": user_input})
+
+        system = _CHAT_SYSTEM.format(profile=profile_summary_text(self.profile))
+        llm = self._get_llm()
+        reply = llm.chat(system=system, messages=self._api_messages())
+
+        # Apply any profile markers embedded in the reply
+        markers = _extract_profile_markers(reply)
+        if markers:
+            _apply_tool_input(markers, self.profile)
+        clean = _strip_profile_markers(reply)
+
+        self.messages.append({"role": "assistant", "content": clean})
+        self._persist()
+        return clean
 
     def coach(
         self,
@@ -241,17 +311,22 @@ class CoachSession:
         llm = self._get_llm()
         coaching_text, tool_input = llm.chat_with_tools(
             system=system,
-            messages=self.messages,
+            messages=self._api_messages(),
             tools=[PROFILE_TOOL],
         )
 
-        # Record assistant turn (text only — tool result handled internally)
+        # Strip any marker blocks before storing / displaying
+        markers = _extract_profile_markers(coaching_text)
+        if markers:
+            _apply_tool_input(markers, self.profile)
+        coaching_text = _strip_profile_markers(coaching_text)
+
         self.messages.append({"role": "assistant", "content": coaching_text})
 
         if tool_input:
             _apply_tool_input(tool_input, self.profile)
-        else:
-            # Fallback: try to find JSON in the text (Ollama, unconfigured models)
+        elif not markers:
+            # Last-resort: try bare JSON in the text (Ollama etc.)
             data = _extract_json_fallback(coaching_text)
             if data:
                 _apply_tool_input(data, self.profile)
@@ -268,14 +343,19 @@ class CoachSession:
         )
         self.messages.append({"role": "user", "content": prompt})
 
-        board = chess.Board()  # use starting position for principle selection
+        board = chess.Board()
         system = self._build_system(board)
         llm = self._get_llm()
         summary_text, tool_input = llm.chat_with_tools(
             system=system,
-            messages=self.messages,
+            messages=self._api_messages(),
             tools=[PROFILE_TOOL],
         )
+
+        markers = _extract_profile_markers(summary_text)
+        if markers:
+            _apply_tool_input(markers, self.profile)
+        summary_text = _strip_profile_markers(summary_text)
 
         self.messages.append({"role": "assistant", "content": summary_text})
 
@@ -315,7 +395,7 @@ def _build_context(
         else:
             lines.append(f"Evaluation shift: {-delta_cp} cp")
 
-    cp = engine_result.get("score_cp")
+    cp   = engine_result.get("score_cp")
     mate = engine_result.get("mate_in")
     source = engine_result.get("source", "local")
     if mate is not None:

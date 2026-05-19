@@ -1,6 +1,12 @@
 """
 Persistent user profile — stores chess identity, lessons learned, opening
 repertoire tendencies, recurring habits, and match history summaries.
+
+Adaptive coaching threshold
+---------------------------
+get_adaptive_threshold(profile) returns a centipawn value used to decide
+whether to coach on a given move.  It accounts for the player's estimated
+rating and recent per-session average centipawn loss history.
 """
 import json
 from datetime import datetime
@@ -11,19 +17,16 @@ _DEFAULT_PROFILE = {
     "username": "",
     "rating_estimate": None,
     "preferred_color": "both",
-    # openings the user tends to play, keyed by color
     "openings": {"white": [], "black": []},
-    # recurring good habits observed
     "strengths": [],
-    # recurring mistakes / weaknesses
     "weaknesses": [],
-    # lessons explicitly given by the coach
     "lessons": [],
-    # free-form notes the coach adds over time
     "coach_notes": [],
     "created_at": "",
     "updated_at": "",
     "total_games_analyzed": 0,
+    # List of avg centipawn-loss values, one per session (most recent last).
+    "accuracy_history": [],
 }
 
 
@@ -32,7 +35,6 @@ def load_profile() -> dict:
     if PROFILE_FILE.exists():
         with open(PROFILE_FILE) as f:
             data = json.load(f)
-        # forward-compat: fill missing keys
         for k, v in _DEFAULT_PROFILE.items():
             data.setdefault(k, v)
         return data
@@ -56,7 +58,6 @@ def append_lesson(profile: dict, lesson: str):
 def append_coach_note(profile: dict, note: str):
     entry = {"ts": datetime.utcnow().isoformat(), "note": note}
     profile["coach_notes"].append(entry)
-    # keep last 100 notes
     profile["coach_notes"] = profile["coach_notes"][-100:]
 
 
@@ -74,11 +75,46 @@ def record_opening(profile: dict, color: str, opening_name: str):
     lst = profile["openings"].get(color, [])
     if opening_name not in lst:
         lst.append(opening_name)
-    profile["openings"][color] = lst[-20:]  # keep last 20
+    profile["openings"][color] = lst[-20:]
+
+
+def record_session_accuracy(profile: dict, avg_cp_loss: float) -> None:
+    """Append this session's average centipawn loss and keep last 20."""
+    hist = profile.setdefault("accuracy_history", [])
+    hist.append(round(avg_cp_loss, 1))
+    profile["accuracy_history"] = hist[-20:]
+
+
+def get_adaptive_threshold(profile: dict, base: int = 100) -> int:
+    """
+    Return a coaching centipawn threshold adapted to the player's level.
+
+    Logic
+    -----
+    - Rating adjustment: lower-rated players get a higher threshold so they
+      aren't coached on every small imprecision.
+      +60 cp at 600, 0 at 1800, capped at -20 for 2000+.
+    - Accuracy adjustment: if the player's recent average cp-loss is high
+      (many blunders), raise the threshold slightly so coaching fires on
+      genuinely significant mistakes, not constant noise.
+    """
+    rating = profile.get("rating_estimate") or 1000
+    rating_adj = max(-20, (1800 - int(rating)) / 20)
+
+    hist = profile.get("accuracy_history", [])
+    if hist:
+        recent_avg = sum(hist[-5:]) / len(hist[-5:])
+        # If average loss > 150 cp, raise threshold slightly to avoid spam
+        accuracy_adj = max(0, (recent_avg - 150) / 5)
+    else:
+        accuracy_adj = 0
+
+    threshold = int(base + rating_adj + accuracy_adj)
+    return max(40, min(250, threshold))
 
 
 # ---------------------------------------------------------------------------
-# Match history — lightweight append-only log
+# Match history
 # ---------------------------------------------------------------------------
 
 def load_history() -> list:
@@ -97,8 +133,12 @@ def append_match_summary(summary: dict):
         json.dump(history, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Conversation persistence
+# ---------------------------------------------------------------------------
+
 def load_conversation() -> list:
-    """Load the persisted coaching conversation from disk."""
+    """Load the full persisted coaching conversation from disk."""
     ensure_data_dir()
     if CONVERSATION_FILE.exists():
         try:
@@ -110,14 +150,17 @@ def load_conversation() -> list:
 
 
 def save_conversation(messages: list) -> None:
-    """Persist the coaching conversation to disk."""
+    """Persist the coaching conversation to disk (full history, no trim)."""
     ensure_data_dir()
     with open(CONVERSATION_FILE, "w") as f:
         json.dump(messages, f)
 
 
+# ---------------------------------------------------------------------------
+# Profile summary for LLM system prompt
+# ---------------------------------------------------------------------------
+
 def profile_summary_text(profile: dict) -> str:
-    """Return a compact text block suitable for an LLM system prompt."""
     lines = [
         f"Player: {profile['username'] or 'Unknown'}",
         f"Estimated rating: {profile['rating_estimate'] or 'Unknown'}",
