@@ -5,6 +5,7 @@ from pathlib import Path
 DATA_DIR = Path.home() / ".chessMentor"
 PROFILE_FILE = DATA_DIR / "profile.json"
 HISTORY_FILE = DATA_DIR / "history.json"
+CONVERSATION_FILE = DATA_DIR / "conversation.json"
 
 # Stockfish path — override via STOCKFISH_PATH env var
 STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "stockfish")
@@ -29,7 +30,10 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 
 # Provider selection
 ENGINE_PROVIDER = os.environ.get("ENGINE_PROVIDER", "auto")   # auto|lichess|local
-VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "claude") # claude|openai|gemini
+VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "claude") # cv|claude|openai|gemini
+# Path to a TorchScript chess piece classifier model for the CV vision provider.
+# Leave empty to use the heuristic (no model required).
+CV_MODEL_PATH   = os.environ.get("CV_MODEL_PATH", "")
 LLM_PROVIDER    = os.environ.get("LLM_PROVIDER", "claude")    # claude|openai|ollama
 
 # Additional API keys

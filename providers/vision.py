@@ -169,11 +169,18 @@ def get_vision_provider(config: dict) -> VisionProvider:
     """
     Factory returning the appropriate vision provider.
 
-    config["vision_provider"] = "claude" | "openai" | "gemini"
+    config["vision_provider"] = "cv" | "claude" | "openai" | "gemini"
+
+    "cv" uses local OpenCV heuristics (+ optional PyTorch CNN) — zero LLM tokens.
     """
     provider = config.get("vision_provider", "claude")
 
-    if provider == "openai":
+    if provider == "cv":
+        from providers.vision_cv import CVVisionProvider
+        return CVVisionProvider(
+            model_path=config.get("cv_model_path") or None,
+        )
+    elif provider == "openai":
         return OpenAIVision(
             api_key=config.get("openai_api_key", ""),
             model=config.get("openai_vision_model", "gpt-4o"),

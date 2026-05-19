@@ -23,7 +23,7 @@ from config import (
     OPENAI_API_KEY, OPENAI_VISION_MODEL, OPENAI_LLM_MODEL,
     GEMINI_API_KEY, GEMINI_VISION_MODEL,
     OLLAMA_BASE_URL, OLLAMA_MODEL,
-    CLAUDE_MODEL,
+    CLAUDE_MODEL, CV_MODEL_PATH,
 )
 from capture import select_region_interactively, capture, image_to_base64, save_debug_image
 import board_analyzer
@@ -75,6 +75,7 @@ def build_config(profile: dict) -> dict:
         "gemini_vision_model": GEMINI_VISION_MODEL,
         "ollama_base_url": OLLAMA_BASE_URL,
         "ollama_model": OLLAMA_MODEL,
+        "cv_model_path": CV_MODEL_PATH,
     }
 
 

@@ -7,3 +7,8 @@ rich>=13.0.0
 openai>=1.0.0
 google-generativeai>=0.5.0
 requests>=2.31.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+# Optional: install torch + torchvision for CNN piece classification
+# torch>=2.0.0
+# torchvision>=0.15.0

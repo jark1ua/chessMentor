@@ -5,7 +5,7 @@ repertoire tendencies, recurring habits, and match history summaries.
 import json
 from datetime import datetime
 from typing import Any
-from config import PROFILE_FILE, HISTORY_FILE, ensure_data_dir
+from config import PROFILE_FILE, HISTORY_FILE, CONVERSATION_FILE, ensure_data_dir
 
 _DEFAULT_PROFILE = {
     "username": "",
@@ -95,6 +95,25 @@ def append_match_summary(summary: dict):
     history.append(summary)
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
+
+
+def load_conversation() -> list:
+    """Load the persisted coaching conversation from disk."""
+    ensure_data_dir()
+    if CONVERSATION_FILE.exists():
+        try:
+            with open(CONVERSATION_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_conversation(messages: list) -> None:
+    """Persist the coaching conversation to disk."""
+    ensure_data_dir()
+    with open(CONVERSATION_FILE, "w") as f:
+        json.dump(messages, f)
 
 
 def profile_summary_text(profile: dict) -> str:
