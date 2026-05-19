@@ -101,36 +101,83 @@ def _king_uncastled(board: chess.Board) -> bool:
            (bk is not None and chess.square_file(bk) == 4 and chess.square_rank(bk) == 7)
 
 
+def _has_isolated_pawn(board: chess.Board) -> bool:
+    for color in (chess.WHITE, chess.BLACK):
+        for sq in board.pieces(chess.PAWN, color):
+            f = chess.square_file(sq)
+            neighbours = [f - 1, f + 1]
+            isolated = True
+            for nf in neighbours:
+                if 0 <= nf <= 7:
+                    for r in range(8):
+                        p = board.piece_at(chess.square(nf, r))
+                        if p and p.piece_type == chess.PAWN and p.color == color:
+                            isolated = False
+                            break
+                if not isolated:
+                    break
+            if isolated:
+                return True
+    return False
+
+
+def _has_doubled_pawn(board: chess.Board) -> bool:
+    for color in (chess.WHITE, chess.BLACK):
+        for f in range(8):
+            count = sum(
+                1 for r in range(8)
+                if (p := board.piece_at(chess.square(f, r)))
+                and p.piece_type == chess.PAWN and p.color == color
+            )
+            if count >= 2:
+                return True
+    return False
+
+
+def _material_imbalance(board: chess.Board) -> bool:
+    """True when material count differs by >= 3 points (rough proxy for imbalance)."""
+    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+              chess.ROOK: 5, chess.QUEEN: 9}
+    w = sum(len(board.pieces(pt, chess.WHITE)) * v for pt, v in values.items())
+    b = sum(len(board.pieces(pt, chess.BLACK)) * v for pt, v in values.items())
+    return abs(w - b) >= 3
+
+
 def _detect_position_tags(board: chess.Board, phase: str) -> Set[str]:
     """Return a set of tag strings describing features present in the position."""
     tags: Set[str] = {phase}
 
     if _has_passed_pawn(board):
-        tags.add("passed_pawn")
-        tags.add("promotion")
+        tags.update(["passed_pawn", "promotion", "blockade"])
     if _has_open_file(board):
-        tags.add("open_file")
-        tags.add("rook")
+        tags.update(["open_file", "rook", "rook_activity"])
     if _has_bishop_vs_knight(board):
-        tags.add("bishop_vs_knight")
-        tags.add("imbalance")
+        tags.update(["bishop_vs_knight", "imbalance"])
     if _has_two_bishops(board):
-        tags.add("two_bishops")
-        tags.add("bishop_pair")
+        tags.update(["two_bishops", "bishop_pair", "open_position"])
     if _king_uncastled(board):
-        tags.add("uncastled_king")
-        tags.add("king_safety")
-        tags.add("castling")
+        tags.update(["uncastled_king", "king_safety", "castling",
+                     "development", "initiative"])
+    if _has_isolated_pawn(board):
+        tags.update(["isolated_pawn", "isolani", "weak_square", "pawn_structure"])
+    if _has_doubled_pawn(board):
+        tags.update(["doubled_pawn", "pawn_structure", "open_file"])
+    if _material_imbalance(board):
+        tags.update(["imbalance", "material", "technique"])
 
     material = _material_points(board)
     if material < 40:
-        tags.add("endgame")
-        tags.add("king_activity")
-        tags.add("rook_endgame")
+        tags.update(["endgame", "king_activity", "rook_endgame",
+                     "king_pawn_endgame", "opposition", "technique"])
+    elif material < 55:
+        tags.update(["endgame", "simplification", "technique"])
 
-    # Always relevant tactical awareness
-    tags.add("candidate_moves")
-    tags.add("blunder_check")
+    if phase == "opening":
+        tags.update(["development", "center_control", "castling",
+                     "purposeful_play", "candidate_moves"])
+
+    # Always relevant
+    tags.update(["candidate_moves", "blunder_check"])
 
     return tags
 
@@ -150,14 +197,22 @@ def _score_principle(principle: dict, position_tags: Set[str], phase: str,
     elif principle["theme"] in ("tactics", "strategy"):
         score += 3
 
+    # Opening entries are only useful in the opening phase
+    if principle["theme"] == "opening" and phase != "opening":
+        score -= 8
+
     # Tag overlap
     p_tags = set(principle.get("tags", []))
     overlap = len(p_tags & position_tags)
     score += overlap * 5
 
-    # Novelty bonus
+    # Novelty bonus — reward principles the player hasn't encountered
     if principle["id"] not in seen_ids:
         score += 8
+
+    # Relationship entries are supplementary — slight penalty to avoid flooding
+    if "relationship" in p_tags:
+        score -= 3
 
     return score
 
