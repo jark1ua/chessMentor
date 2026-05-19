@@ -18,12 +18,14 @@ import chess
 
 from config import (
     CAPTURE_INTERVAL, COACHING_THRESHOLD, ANTHROPIC_API_KEY,
-    ENGINE_PROVIDER, VISION_PROVIDER, LLM_PROVIDER,
+    ENGINE_PROVIDER, VISION_PROVIDER, LLM_PROVIDER, LLM_FALLBACK_CHAIN,
     STOCKFISH_PATH, ENGINE_TOP_MOVES,
     OPENAI_API_KEY, OPENAI_VISION_MODEL, OPENAI_LLM_MODEL,
     GEMINI_API_KEY, GEMINI_VISION_MODEL,
     OLLAMA_BASE_URL, OLLAMA_MODEL,
     CLAUDE_MODEL, CV_MODEL_PATH,
+    OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_SITE_URL, OPENROUTER_APP_NAME,
+    DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
 )
 from capture import select_region_interactively, capture, image_to_base64, save_debug_image
 import board_analyzer
@@ -76,6 +78,13 @@ def build_config(profile: dict) -> dict:
         "ollama_base_url": OLLAMA_BASE_URL,
         "ollama_model": OLLAMA_MODEL,
         "cv_model_path": CV_MODEL_PATH,
+        "openrouter_api_key": OPENROUTER_API_KEY,
+        "openrouter_model": OPENROUTER_MODEL,
+        "openrouter_site_url": OPENROUTER_SITE_URL,
+        "openrouter_app_name": OPENROUTER_APP_NAME,
+        "deepseek_api_key": DEEPSEEK_API_KEY,
+        "deepseek_model": DEEPSEEK_MODEL,
+        "llm_fallback_chain": LLM_FALLBACK_CHAIN,
     }
 
 

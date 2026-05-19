@@ -34,11 +34,20 @@ VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "claude") # cv|claude|openai
 # Path to a TorchScript chess piece classifier model for the CV vision provider.
 # Leave empty to use the heuristic (no model required).
 CV_MODEL_PATH   = os.environ.get("CV_MODEL_PATH", "")
-LLM_PROVIDER    = os.environ.get("LLM_PROVIDER", "claude")    # claude|openai|ollama
+LLM_PROVIDER    = os.environ.get("LLM_PROVIDER", "claude")
+# LLM_PROVIDER options: claude | openai | openrouter | deepseek | ollama | fallback
+# When fallback: comma-separated chain tried in order
+LLM_FALLBACK_CHAIN = os.environ.get("LLM_FALLBACK_CHAIN", "openrouter,claude")
 
 # Additional API keys
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.environ.get("OPENROUTER_APP_NAME", "ChessMentor")
+DEEPSEEK_API_KEY    = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL      = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # Ollama settings
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")

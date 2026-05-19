@@ -1,17 +1,27 @@
 """
 LLM provider abstraction for chess coaching conversations.
 
-Backends:
-  - ClaudeLLM  : Anthropic Claude — tool use + prompt caching
-  - OpenAILLM  : OpenAI GPT — function calling
-  - OllamaLLM  : local Ollama — JSON text fallback (no native tool use)
+Backends
+--------
+  ClaudeLLM      Anthropic Claude — tool use + prompt caching
+  OpenAILLM      OpenAI GPT — function calling
+  OpenRouterLLM  openrouter.ai — single key, 200+ models, OpenAI-compatible
+                 Recommended free/cheap models:
+                   deepseek/deepseek-chat          (DeepSeek-V3, near-free)
+                   deepseek/deepseek-r1            (reasoning, very cheap)
+                   meta-llama/llama-3.3-70b-instruct (free tier available)
+                   mistralai/mistral-7b-instruct   (free tier)
+                   google/gemini-flash-1.5         (cheap)
+  DeepSeekLLM    DeepSeek direct API — OpenAI-compatible, extremely low cost
+  OllamaLLM      local Ollama — JSON text fallback (no native tool use)
+  FallbackLLM    Tries providers in order; moves to the next on any error.
+                 Use this to maximise uptime and manage costs automatically.
 
 Every provider exposes two methods:
-  chat(system, messages)               -> str          (plain, no tools)
+  chat(system, messages)                   -> str
   chat_with_tools(system, messages, tools) -> (str, dict|None)
-      Returns (coaching_text, tool_input_dict_or_None).
-      tool_input_dict is the parsed arguments from the first tool call,
-      or None if no tool call was made.
+      coaching_text : prose reply
+      tool_input    : parsed tool-call arguments dict, or None
 """
 
 from __future__ import annotations
@@ -270,24 +280,180 @@ class OllamaLLM(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter — single API key, 200+ models, OpenAI-compatible wire format
+# ---------------------------------------------------------------------------
+
+class OpenRouterLLM(OpenAILLM):
+    """
+    openrouter.ai backend.
+
+    Uses the OpenAI SDK pointed at https://openrouter.ai/api/v1.
+    Model names follow the provider/model-slug convention, e.g.:
+      deepseek/deepseek-chat
+      deepseek/deepseek-r1
+      meta-llama/llama-3.3-70b-instruct
+      mistralai/mistral-7b-instruct
+      google/gemini-flash-1.5
+      anthropic/claude-opus-4-7
+      openai/gpt-4o
+
+    Free models (no cost): check https://openrouter.ai/models?q=free
+    Tool use: supported for all models that declare it in their capabilities.
+    """
+
+    OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
+    def __init__(self, api_key: str, model: str, site_url: str = "", app_name: str = "ChessMentor"):
+        super().__init__(api_key=api_key, model=model)
+        self._site_url = site_url
+        self._app_name = app_name
+
+    def _get_client(self):
+        if self._client is None:
+            import openai
+            self._client = openai.OpenAI(
+                api_key=self._api_key,
+                base_url=self.OPENROUTER_BASE,
+                default_headers={
+                    "HTTP-Referer": self._site_url,
+                    "X-Title": self._app_name,
+                },
+            )
+        return self._client
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek — direct API, OpenAI-compatible, extremely low cost
+# ---------------------------------------------------------------------------
+
+class DeepSeekLLM(OpenAILLM):
+    """
+    DeepSeek direct API (api.deepseek.com).
+
+    Models:
+      deepseek-chat    DeepSeek-V3 — general purpose, very cheap
+      deepseek-reasoner  DeepSeek-R1 — chain-of-thought reasoning
+
+    Pricing as of 2025: ~$0.014 / 1M input tokens (cache hit), ~$0.28 output.
+    Effectively free for light coaching use.
+    """
+
+    DEEPSEEK_BASE = "https://api.deepseek.com/v1"
+
+    def _get_client(self):
+        if self._client is None:
+            import openai
+            self._client = openai.OpenAI(
+                api_key=self._api_key,
+                base_url=self.DEEPSEEK_BASE,
+            )
+        return self._client
+
+
+# ---------------------------------------------------------------------------
+# FallbackLLM — try providers in order, advance on any exception
+# ---------------------------------------------------------------------------
+
+class FallbackLLM(LLMProvider):
+    """
+    Wraps an ordered list of providers.  On any exception from the primary,
+    logs a warning and tries the next.  Useful for:
+      - Cost management (cheap model first, expensive as backup)
+      - Uptime (API outage resilience)
+      - Free tier exhaustion (OpenRouter free → DeepSeek → Claude)
+
+    Example config:
+      LLM_PROVIDER=fallback
+      LLM_FALLBACK_CHAIN=openrouter,deepseek,claude
+    """
+
+    def __init__(self, providers: List[LLMProvider]):
+        if not providers:
+            raise ValueError("FallbackLLM requires at least one provider")
+        self._providers = providers
+
+    def _try(self, method_name: str, *args, **kwargs):
+        last_exc: Optional[Exception] = None
+        for p in self._providers:
+            try:
+                return getattr(p, method_name)(*args, **kwargs)
+            except Exception as exc:
+                import warnings
+                warnings.warn(
+                    f"[FallbackLLM] {type(p).__name__} failed ({exc}), trying next provider"
+                )
+                last_exc = exc
+        raise RuntimeError(
+            f"All LLM providers failed. Last error: {last_exc}"
+        ) from last_exc
+
+    def chat(self, system: str, messages: List[Dict]) -> str:
+        return self._try("chat", system, messages)
+
+    def chat_with_tools(
+        self, system: str, messages: List[Dict], tools: List[Dict]
+    ) -> Tuple[str, Optional[Dict]]:
+        return self._try("chat_with_tools", system, messages, tools)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def get_llm_provider(config: dict) -> LLMProvider:
-    provider = config.get("llm_provider", "claude")
-
-    if provider == "openai":
+def _build_single(name: str, config: dict) -> LLMProvider:
+    """Build one named provider from config."""
+    name = name.strip().lower()
+    if name == "openai":
         return OpenAILLM(
             api_key=config.get("openai_api_key", ""),
             model=config.get("openai_llm_model", "gpt-4o"),
         )
-    elif provider == "ollama":
+    elif name == "openrouter":
+        return OpenRouterLLM(
+            api_key=config.get("openrouter_api_key", ""),
+            model=config.get("openrouter_model", "deepseek/deepseek-chat"),
+            site_url=config.get("openrouter_site_url", ""),
+            app_name=config.get("openrouter_app_name", "ChessMentor"),
+        )
+    elif name == "deepseek":
+        return DeepSeekLLM(
+            api_key=config.get("deepseek_api_key", ""),
+            model=config.get("deepseek_model", "deepseek-chat"),
+        )
+    elif name == "ollama":
         return OllamaLLM(
             base_url=config.get("ollama_base_url", "http://localhost:11434"),
             model=config.get("ollama_model", "llama3"),
         )
-    else:  # "claude"
+    else:  # "claude" or default
         return ClaudeLLM(
             api_key=config.get("anthropic_api_key", ""),
             model=config.get("claude_model", "claude-opus-4-7"),
         )
+
+
+def get_llm_provider(config: dict) -> LLMProvider:
+    """
+    Factory returning the appropriate LLM provider.
+
+    LLM_PROVIDER accepts:
+      claude | openai | openrouter | deepseek | ollama
+      fallback  — uses LLM_FALLBACK_CHAIN (comma-separated list of the above)
+
+    Examples:
+      LLM_PROVIDER=openrouter
+      OPENROUTER_API_KEY=sk-or-...
+      OPENROUTER_MODEL=deepseek/deepseek-chat
+
+      LLM_PROVIDER=fallback
+      LLM_FALLBACK_CHAIN=openrouter,deepseek,claude
+    """
+    provider = config.get("llm_provider", "claude").strip().lower()
+
+    if provider == "fallback":
+        chain_str = config.get("llm_fallback_chain", "claude")
+        chain_names = [n.strip() for n in chain_str.split(",") if n.strip()]
+        providers = [_build_single(n, config) for n in chain_names]
+        return FallbackLLM(providers)
+
+    return _build_single(provider, config)
