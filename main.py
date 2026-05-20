@@ -240,11 +240,13 @@ class Session:
         profile: dict,
         llm_provider,
         clock_region=None,
+        app_state=None,
     ):
         self.region = region
         self.profile = profile
         self.coach_session = CoachSession(profile, llm_provider=llm_provider, debug=True)
         self.clock_region = clock_region
+        self.app_state = app_state
 
         # Use adaptive threshold based on rating + accuracy history
         self.coaching_threshold = get_adaptive_threshold(profile, base=COACHING_THRESHOLD)
@@ -268,17 +270,25 @@ class Session:
 
     def stop(self, *_):
         self.running = False
+        if self.app_state is not None:
+            self.app_state.set_running(False)
 
     def run(self):
         info(f"Capturing every {CAPTURE_INTERVAL}s — Ctrl+C to stop.")
-        signal.signal(signal.SIGINT,  self.stop)
-        signal.signal(signal.SIGTERM, self.stop)
+        # Signal handlers only work in the main thread; skip silently otherwise.
+        try:
+            signal.signal(signal.SIGINT,  self.stop)
+            signal.signal(signal.SIGTERM, self.stop)
+        except ValueError:
+            pass
 
         while self.running:
             try:
                 self._tick()
             except Exception as exc:
                 warn(f"Tick error: {exc}")
+                if self.app_state is not None:
+                    self.app_state.add_event("error", f"Tick error: {exc}")
             time.sleep(CAPTURE_INTERVAL)
 
         self._wrap_up()
@@ -361,23 +371,45 @@ class Session:
             or self.move_count % 5 == 0
         )
 
+        msg = ""
         if should_coach:
             try:
                 msg = self.coach_session.coach(
                     board, engine_result, last_move_san, delta, self.player_color
                 )
                 if short_coaching:
-                    # Truncate to first 2 sentences under time pressure
                     sentences = msg.replace("! ", "!|").replace(". ", ".|").split("|")
                     msg = " ".join(sentences[:2]).strip()
                 coach_msg(msg)
-                # Record position with coach annotation in PGN
                 self.recorder.record_position(board, coach_comment=msg)
+                if self.app_state is not None:
+                    self.app_state.add_event("coach", msg, {"fen": fen})
             except Exception as exc:
                 warn(f"Coach error: {exc}")
+                if self.app_state is not None:
+                    self.app_state.add_event("error", f"Coach error: {exc}")
         else:
-            # Still record the position (no annotation)
             self.recorder.record_position(board)
+            if self.app_state is not None and last_move_san:
+                self.app_state.add_event(
+                    "position",
+                    f"Move {self.move_count}: {last_move_san}",
+                    {"fen": fen},
+                )
+
+        # Push live state to web UI if attached
+        if self.app_state is not None:
+            self.app_state.update_position(
+                fen=fen,
+                eval_cp=curr_cp,
+                eval_mate=engine_result.get("mate_in"),
+                source=engine_result.get("source", ""),
+                opening=self._current_opening,
+                opening_eco=(opening[0] if opening else None),
+                color=self.player_color,
+                last_msg=msg,
+                move_count=self.move_count,
+            )
 
     @staticmethod
     def _detect_last_move(
@@ -397,7 +429,11 @@ class Session:
 
     def _wrap_up(self):
         info("Session ending — requesting post-game summary...")
-        result = ask("Game result? (1-0 / 0-1 / 1/2-1/2 / unknown):").strip() or "unknown"
+        if self.app_state is not None:
+            # Web mode: result came in via /api/session/stop
+            result = (self.app_state.pending_result or "unknown").strip() or "unknown"
+        else:
+            result = ask("Game result? (1-0 / 0-1 / 1/2-1/2 / unknown):").strip() or "unknown"
 
         # Save annotated PGN
         try:
@@ -440,7 +476,12 @@ class Session:
         engine_module.close_engine()
         info("Profile saved. Goodbye!")
 
-        # Offer to review the game
+        if self.app_state is not None:
+            self.app_state.add_event("system", "Session ended — summary saved.")
+            self.app_state.reset_session()
+            return
+
+        # CLI mode: offer to review the game
         if pgn_path and pgn_path.exists():
             do_review = ask("Review key positions now? (y/N):").strip().lower()
             if do_review == "y":
@@ -464,7 +505,8 @@ def main():
     parser.add_argument("--review",        metavar="FILE",      nargs="?", const="__latest__",
                         help="Review last saved PGN (or specify a file)")
     parser.add_argument("--puzzles",       action="store_true", help="Tactical puzzles from your weakness profile")
-    parser.add_argument("--dashboard",     action="store_true", help="Launch web stats dashboard")
+    parser.add_argument("--serve",         action="store_true", help="Launch the web control panel (full UI)")
+    parser.add_argument("--dashboard",     action="store_true", help="Alias for --serve")
     parser.add_argument("--dashboard-port", metavar="PORT", type=int, default=DASHBOARD_PORT,
                         help=f"Dashboard port (default: {DASHBOARD_PORT})")
     parser.add_argument("--debug-capture", action="store_true", help="Capture one screenshot and exit")
@@ -476,7 +518,7 @@ def main():
     if args.set_name:  cmd_set_name(args.set_name); return
     if args.set_rating: cmd_set_rating(args.set_rating); return
 
-    if args.dashboard:
+    if args.serve or args.dashboard:
         from dashboard import run_dashboard
         run_dashboard(port=args.dashboard_port)
         return

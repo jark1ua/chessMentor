@@ -2,6 +2,14 @@ import os
 import json
 from pathlib import Path
 
+# Apply persisted UI settings to os.environ BEFORE we read any env vars below.
+# This lets settings saved via the web control panel override env-var defaults.
+try:
+    from settings import apply_settings_to_env
+    apply_settings_to_env()
+except Exception:
+    pass
+
 DATA_DIR = Path.home() / ".chessMentor"
 PROFILE_FILE = DATA_DIR / "profile.json"
 HISTORY_FILE = DATA_DIR / "history.json"
